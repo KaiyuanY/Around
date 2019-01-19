@@ -19,6 +19,8 @@ import (
 
 	jwtmiddleware "github.com/auth0/go-jwt-middleware"
 	jwt "github.com/dgrijalva/jwt-go"
+
+	"path/filepath"
 )
 
 const (
@@ -30,6 +32,8 @@ const (
 	ES_URL = "http://35.235.111.237:9200/"
 
 	BUCKET_NAME = "post-images-around-kevin"
+
+	API_PREFIX = "/api/v1"
 )
 
 type Location struct {
@@ -43,7 +47,23 @@ type Post struct {
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
 	Url      string   `json:"url"`
+	Type     string   `json:"type"`
+	Face     float64  `json:"face"`
 }
+
+var (
+	mediaTypes = map[string]string{
+		".jpeg": "image",
+		".jpg":  "image",
+		".gif":  "image",
+		".png":  "image",
+		".mov":  "video",
+		".mp4":  "video",
+		".avi":  "video",
+		".flv":  "video",
+		".wmv":  "video",
+	}
+)
 
 func main() {
 	fmt.Println("started-service")
@@ -59,13 +79,19 @@ func main() {
 	})
 
 	r := mux.NewRouter()
-	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
-	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
-	r.Handle("/signup", http.HandlerFunc(handlerSignup)).Methods("POST")
-	r.Handle("/login", http.HandlerFunc(handlerLogin)).Methods("POST")
 
-	http.Handle("/", r)
+	r.Handle(API_PREFIX+"/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST", "OPTIONS")
+	r.Handle(API_PREFIX+"/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET", "OPTIONS")
+	r.Handle(API_PREFIX+"/cluster", jwtMiddleware.Handler(http.HandlerFunc(handlerCluster))).Methods("GET", "OPTIONS")
 
+	r.Handle(API_PREFIX+"/login", http.HandlerFunc(handlerLogin)).Methods("POST", "OPTIONS")
+	r.Handle(API_PREFIX+"/signup", http.HandlerFunc(handlerSignup)).Methods("POST", "OPTIONS")
+
+	// Backend endpoints.
+	http.Handle(API_PREFIX+"/", r)
+
+	//http.Handle("/", r)
+	fmt.Println("Start service")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -149,6 +175,27 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.Url = attrs.MediaLink
+
+	im, header, _ := r.FormFile("image")
+	defer im.Close()
+	suffix := filepath.Ext(header.Filename)
+
+	// Client needs to know the media type so as to render it.
+	if t, ok := mediaTypes[suffix]; ok {
+		p.Type = t
+	} else {
+		p.Type = "unknown"
+	}
+	// ML Engine only supports jpeg.
+	if suffix == ".jpeg" {
+		if score, err := annotate(im); err != nil {
+			http.Error(w, "Failed to annotate the image", http.StatusInternalServerError)
+			fmt.Printf("Failed to annotate the image %v\n", err)
+			return
+		} else {
+			p.Face = score
+		}
+	}
 
 	err = saveToES(p, id)
 	if err != nil {
@@ -288,4 +335,74 @@ func saveToGCS(r io.Reader, bucketName, objectName string) (*storage.ObjectAttrs
 
 	fmt.Printf("Image is saved to GCS: %s\n", attrs.MediaLink)
 	return attrs, nil
+}
+
+func handlerCluster(w http.ResponseWriter, r *http.Request) {
+	// Parse from body of request to get a json object.
+	fmt.Println("Received one post request")
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	//some front end will check with this before sending the real request
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	if r.Method != "GET" {
+		return
+	}
+
+	term := r.URL.Query().Get("term")
+
+	// Create a client
+	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
+	if err != nil {
+		http.Error(w, "ES is not setup", http.StatusInternalServerError)
+		fmt.Printf("ES is not setup %v\n", err)
+		return
+	}
+
+	// Range query.
+	// For details, https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-range-query.html
+	q := elastic.NewRangeQuery(term).Gte(0.9)
+
+	searchResult, err := client.Search().
+		Index(POST_INDEX).
+		Query(q).
+		Pretty(true).
+		Do(context.Background())
+	if err != nil {
+		// Handle error
+		m := fmt.Sprintf("Failed to query ES %v", err)
+		fmt.Println(m)
+		http.Error(w, m, http.StatusInternalServerError)
+	}
+
+	// searchResult is of type SearchResult and returns hits, suggestions,
+	// and all kinds of other information from Elasticsearch.
+	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
+	// TotalHits is another convenience function that works even when something goes wrong.
+	fmt.Printf("Found a total of %d post\n", searchResult.TotalHits())
+
+	// Each is a convenience function that iterates over hits in a search result.
+	// It makes sure you don't need to check for nil values in the response.
+	// However, it ignores errors in serialization.
+	var typ Post
+	var ps []Post
+	for _, item := range searchResult.Each(reflect.TypeOf(typ)) {
+		p := item.(Post)
+		ps = append(ps, p)
+
+	}
+	js, err := json.Marshal(ps)
+	if err != nil {
+		m := fmt.Sprintf("Failed to parse post object %v", err)
+		fmt.Println(m)
+		http.Error(w, m, http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(js)
 }
