@@ -36,7 +36,7 @@ type MlRequest struct {
 }
 
 var (
-	project = "cohesive-slate-228422"
+	project = "mindful-acre-225722"
 	model   = "face_abc"
 	url     = "https://ml.googleapis.com/v1/projects/" + project + "/models/" + model + ":predict"
 	scope   = "https://www.googleapis.com/auth/cloud-platform"
